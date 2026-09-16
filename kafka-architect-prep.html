@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kafka Architect Interview Prep — Multi-Tenant Streaming at 100M Events/sec</title>
+<style>
+  :root{--bg:#0b1020;--panel:#121a2b;--text:#e8eefc;--muted:#a9b5ce;--accent:#67b7ff;--green:#66d19e;--orange:#ffbf69;--red:#ff7b7b;--line:#28334b;--shadow:0 12px 30px rgba(0,0,0,.2)}
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#09101e,#0b1020 35%,#0b1020);color:var(--text);font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  a{color:var(--accent)} .wrap{max-width:1180px;margin:auto;padding:28px 22px 70px}
+  header{padding:28px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(135deg,#101a31,#121a2b);box-shadow:var(--shadow)}
+  h1{font-size:36px;line-height:1.15;margin:0 0 8px} h2{font-size:27px;margin:46px 0 14px} h3{font-size:20px;margin:26px 0 10px} p{margin:10px 0} .lead{color:var(--muted);max-width:900px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}.chip{padding:6px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted);background:#0d1525}
+  nav{margin-top:18px;display:flex;flex-wrap:wrap;gap:9px} nav a{text-decoration:none;padding:7px 11px;border:1px solid var(--line);border-radius:9px;background:#0d1525}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{padding:18px;border:1px solid var(--line);border-radius:15px;background:var(--panel);box-shadow:var(--shadow)}
+  .metric{font-size:29px;font-weight:750;color:var(--accent);margin-bottom:2px}.small{font-size:13px;color:var(--muted)}
+  pre{overflow:auto;padding:18px;border:1px solid var(--line);border-radius:14px;background:#08101d;color:#dbe7ff;line-height:1.45}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace} table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden} th,td{padding:11px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top} th{color:#f3f6ff;background:#0f1729}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:13px;margin:12px 0;padding:0 15px} summary{cursor:pointer;padding:14px 0;font-weight:680} details>div{padding:0 0 16px;color:#d1dbef}
+  .callout{padding:16px 18px;border-left:4px solid var(--accent);background:#0d1728;border-radius:10px;margin:16px 0}.warn{border-left-color:var(--orange)}.good{border-left-color:var(--green)}.danger{border-left-color:var(--red)}
+  footer{margin-top:50px;color:var(--muted);border-top:1px solid var(--line);padding-top:18px}
+  @media(max-width:700px){h1{font-size:28px}.wrap{padding:16px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Kafka Architect Interview Prep</h1>
+  <p class="lead">Whiteboard-ready preparation for designing high-scale, multi-tenant streaming platforms — with a focus on the 100M events/sec problem, noisy neighbors, quotas, isolation, burst handling, reliability, DR, and trade-offs.</p>
+  <div class="chips"><span class="chip">Architect / Staff+</span><span class="chip">Kafka</span><span class="chip">100M events/sec</span><span class="chip">Multi-tenant</span><span class="chip">Multi-region</span><span class="chip">Whiteboard</span></div>
+  <nav><a href="#problem">Problem</a><a href="#math">Capacity Math</a><a href="#architecture">Architecture</a><a href="#multitenancy">Multi-tenancy</a><a href="#burst">Burst Handling</a><a href="#failures">Failures</a><a href="#dr">DR</a><a href="#questions">Follow-ups</a><a href="#links">References</a></nav>
+</header>
+<section id="problem"><h2>1. The interview problem</h2><div class="card"><strong>Prompt:</strong> Design a Kafka-based platform that can support <strong>100M events/sec</strong>. Multiple tenants produce events and have downstream consumers. One tenant suddenly has a huge traffic burst. How do you prevent a noisy neighbor from affecting everyone else? Would you re-architect any components?</div><div class="callout good"><strong>Architect mindset:</strong> Do not jump straight to “add brokers.” Treat this as a platform problem involving capacity, admission control, tenant isolation, buffering, downstream protection, and a control plane.</div></section>
+<section id="math"><h2>2. Start with the capacity math</h2><div class="grid"><div class="card"><div class="metric">100M/s</div>Peak event rate</div><div class="card"><div class="metric">~100 GB/s</div>Logical ingress at 1 KB/event</div><div class="card"><div class="metric">~8.64 PB/day</div>Raw logical data/day</div><div class="card"><div class="metric">~25.9 PB/day</div>RF=3 physical copy volume/day, before compression/overhead</div></div><pre><code>100M events/s × 1 KB ≈ 100 GB/s
+100 GB/s × 86,400 ≈ 8.64 PB/day
+8.64 PB/day × RF(3) ≈ 25.9 PB/day</code></pre><div class="callout warn"><strong>Interview point:</strong> Kafka should usually be your hot, replayable event backbone—not your cheapest long-term archive. Think Kafka + object storage/data lake.</div></section>
+<section id="architecture"><h2>3. High-level architecture</h2><pre><code>                           CONTROL PLANE
+                                |
+           +--------------------+----------------------+
+           |                    |                      |
+     Tenant Registry      Policy / Quotas       Capacity Manager
+           |                    |                      |
+           +--------------------+----------------------+
+                                |
+                                v
+                         Tenant Ingestion
+                                |
+                      Admission / Rate Limit
+                                |
+                                v
+                          Tenant Router
+                         /      |       \
+                        /       |        \
+                       v        v         v
+                  Shared-A   Shared-B   Dedicated
+                    Kafka      Kafka     Tenant-X
+                       \         |         /
+                        +--------+--------+
+                                 |
+                         Stream Processing
+                                 |
+              +------------------+------------------+
+              |                  |                  |
+          Analytics            Fraud             Search
+              |                  |                  |
+              v                  v                  v
+          Data Lake              DB                Index
+
+Cross-region: replicate selected critical topics asynchronously for DR.</code></pre><p>The core pattern is <strong>shared-by-default, quota-protected, burst-tolerant, selectively isolated</strong>.</p></section>
+<section id="multitenancy"><h2>4. Multi-tenant isolation model</h2><table><thead><tr><th>Tenant tier</th><th>Characteristics</th><th>Placement</th><th>Protection</th></tr></thead><tbody><tr><td>Small</td><td>Predictable, low volume</td><td>Shared cluster</td><td>Kafka quotas + shared consumer pool</td></tr><tr><td>Medium</td><td>Higher steady rate</td><td>Shared cluster with stronger reservation/policy</td><td>Quotas + partition capacity + autoscaling</td></tr><tr><td>Large</td><td>High volume / strict SLA</td><td>Isolated topic/partition pool or dedicated cluster</td><td>Dedicated capacity</td></tr><tr><td>Extreme</td><td>Huge + bursty + unpredictable</td><td>Dedicated cluster</td><td>Dedicated brokers + consumers + policy</td></tr></tbody></table><h3>Isolation has multiple dimensions</h3><pre><code>Tenant isolation
+  ├── Access isolation     → authentication / ACLs
+  ├── Namespace isolation  → topics / logical namespaces
+  ├── Performance isolation→ quotas / reservations
+  ├── Compute isolation    → consumer pools / node pools
+  └── Failure isolation    → dedicated clusters / regions</code></pre></section>
+<section id="burst"><h2>5. What happens when one tenant bursts?</h2><pre><code>Tenant A: 500 MB/s → 8 GB/s
+             |
+             v
+      Admission Control
+             |
+       +-----+------+
+       |            |
+   within limit   exceeds limit
+       |            |
+       v            v
+     Kafka      Buffer / throttle
+                    |
+                    v
+             Control Plane
+                    |
+          +---------+---------+
+          |                   |
+     short-lived          sustained
+          |                   |
+       drain burst         promote / isolate</code></pre><h3>Short burst</h3><p>Use quotas, backpressure, and buffering. Do not immediately migrate infrastructure for every spike.</p><h3>Sustained high-volume tenant</h3><p>Use policy-driven promotion to dedicated topics/partition pools or a dedicated Kafka cluster. This is an architectural isolation decision, not just autoscaling.</p><div class="callout"><strong>Important:</strong> A buffer absorbs a burst; it does not create capacity. If ingress is 10 GB/s and the sustainable drain rate is 2 GB/s, backlog grows at 8 GB/s until the burst ends or capacity increases.</div></section>
+<section><h2>6. Kafka quotas</h2><p>Kafka supports client quotas for protecting shared clusters from high-volume clients. Use them as a first line of defense.</p><pre><code>Tenant A → 500 MB/s producer quota
+Tenant B → 200 MB/s producer quota
+Tenant C →   1 GB/s producer quota</code></pre><div class="callout warn"><strong>Don't overclaim:</strong> Quotas protect shared broker resources. They do not by themselves solve business-aware burst absorption, downstream overload, or automatic tenant promotion.</div></section>
+<section><h2>7. Partitioning and ordering</h2><pre><code>partition = hash(customerId) % N</code></pre><p>This gives <strong>ordering per customer key</strong> while permitting parallel processing across customers.</p><div class="callout danger"><strong>Hot key trade-off:</strong> If one customer generates enormous traffic, strict ordering can pin that customer to one partition. Sharding the customer can restore horizontal scalability but changes the ordering semantics.</div></section>
+<section><h2>8. Partition sizing methodology</h2><p>Do not quote a universal Kafka partition throughput number. Benchmark your actual workload.</p><pre><code>Required partitions ≈ total throughput / sustainable throughput per partition</code></pre><p>Illustrative example: if a production-equivalent benchmark establishes 25 MB/s as the sustainable partition target:</p><pre><code>100 GB/s / 25 MB/s ≈ 4,000 partitions</code></pre><p>Then add headroom, account for uneven partitioning and validate recovery behavior. Exact production sizing should be benchmark-driven.</p></section>
+<section><h2>9. Broker sizing</h2><p>Size against the limiting resource rather than one throughput number:</p><pre><code>Broker fleet size = max(network, disk, CPU requirements)
+                   × replication / recovery headroom</code></pre><p>Benchmark under peak traffic, RF=3, normal consumer traffic, and broker/AZ failures. A cluster that works at 95% utilization in steady state may not have enough capacity to recover from failure.</p></section>
+<section><h2>10. Consumer isolation</h2><pre><code>Kafka
+  |
+  +--> Shared Consumer Pool → small/medium tenants
+  |
+  +--> Dedicated Consumer Pool → large tenant</code></pre><p>Protect downstream dependencies too. Autoscaling consumers without considering database/API capacity can simply move the outage downstream.</p><pre><code>Kafka → Consumer → Bulkhead / Rate Limit → DB / Search / API</code></pre></section>
+<section id="failures"><h2>11. Failure scenarios</h2><details><summary>Broker failure</summary><div>Replica becomes leader when appropriate; clients reconnect. Recovery consumes disk/network capacity, so recovery capacity must be part of planning.</div></details><details><summary>Availability-zone failure</summary><div>Replicas should be spread across failure domains. Surviving brokers must have enough spare capacity to absorb the load.</div></details><details><summary>Consumer crash after DB commit</summary><div>The event can be processed again. Use stable event IDs and idempotent business processing; do not assume Kafka offsets eliminate duplicates.</div></details><details><summary>Poison message</summary><div>Route repeatedly failing records to a DLQ with topic, partition, offset, event ID, error, schema version, and original payload so the message can be diagnosed and replayed safely.</div></details><details><summary>Downstream DB is slower than Kafka</summary><div>Use Kafka or another durable queue as a buffer between stages, but monitor backlog and retention so the buffer does not silently exhaust.</div></details></section>
+<section id="dr"><h2>12. Multi-region DR</h2><pre><code>          US Kafka  ===== async =====>  EU Kafka
+              ^                           |
+              |                           v
+          EU Kafka  ===== async =====>  US Kafka</code></pre><p>For a one-minute RPO, monitor cross-region replication lag continuously. Don't claim a zero-RPO design unless the architecture actually provides it.</p><p>Use regional ingestion to avoid unnecessary WAN traffic. Replicate only the data that actually requires cross-region recovery; replicating everything everywhere can multiply storage and network cost.</p></section>
+<section><h2>13. Schema governance</h2><pre><code>Producer → Schema Registry / Compatibility Check → Kafka → Consumer</code></pre><p>Every event should carry an event ID, event type, schema version, event time, and tracing context where appropriate.</p></section>
+<section><h2>14. Replay strategy</h2><pre><code>Kafka
+  ├── Production Consumer Group
+  └── Replay Consumer Group</code></pre><p>Use separate consumer groups for replay. Be especially careful when replaying side effects such as payments, notifications, or shipping actions.</p></section>
+<section><h2>15. Control plane vs data plane</h2><pre><code>CONTROL PLANE
+  Tenant registry
+  Quota policy
+  Placement
+  Promotion / demotion
+  Capacity management
+  Observability / policy
+           |
+           v
+DATA PLANE
+  Ingestion → Kafka → Processing → Downstream systems</code></pre><p>This separation is one of the strongest architectural ideas in the problem. The control plane decides how the data plane should behave; it does not process the event stream itself.</p></section>
+<section><h2>16. What not to do</h2><div class="grid"><div class="card"><strong>Don't:</strong><br>Give every tenant a dedicated Kafka cluster by default.</div><div class="card"><strong>Don't:</strong><br>Assume adding brokers instantly solves a short-lived burst.</div><div class="card"><strong>Don't:</strong><br>Use global ordering as the default requirement.</div><div class="card"><strong>Don't:</strong><br>Autoscale consumers without protecting downstream systems.</div><div class="card"><strong>Don't:</strong><br>Claim exactly-once for external side effects without business-level idempotency.</div><div class="card"><strong>Don't:</strong><br>Size the cluster at 90–100% steady-state utilization.</div></div></section>
+<section id="questions"><h2>17. Interview follow-up drill</h2><details><summary>Why Kafka quotas instead of a gateway?</summary><div>Use both when useful. Kafka quotas protect broker resources; a gateway can enforce business-aware policies, prioritize events, perform tenant-aware routing, and expose tenant-specific admission control.</div></details><details><summary>Why multiple clusters?</summary><div>To reduce blast radius, isolate noisy tenants, simplify operations, and allow independent capacity and lifecycle management.</div></details><details><summary>How many partitions?</summary><div>Derive from measured sustainable partition throughput, then add headroom and validate failure/recovery behavior. Never present a theoretical number as a production guarantee.</div></details><details><summary>How do you handle a single hot customer?</summary><div>Either preserve strict ordering on one partition and accept the ceiling, or shard the key and introduce downstream logic to restore only the ordering semantics the business actually needs.</div></details><details><summary>Why not exactly-once everywhere?</summary><div>Exactly-once is valuable for selected workflows but can add complexity and coordination. A common platform default is at-least-once transport plus idempotent processing, with stronger guarantees where required.</div></details><details><summary>What if the burst exceeds every buffer?</summary><div>Define explicit policy: throttle, backpressure, prioritize critical events, spill to durable storage when appropriate, or reject best-effort traffic. No system can provide infinite buffering.</div></details><details><summary>How do you know when to promote a tenant?</summary><div>Use sustained ingress rate, throttle time, partition hotness, consumer lag, cluster utilization, SLA class, and duration thresholds—not a single instantaneous spike.</div></details><details><summary>How do you protect the database?</summary><div>Bound concurrency, rate-limit, batch, bulkhead, and keep Kafka as a durable buffer. Consumer autoscaling must respect downstream capacity.</div></details></section>
+<section><h2>18. The 2-minute architect answer</h2><div class="callout good"><p>“I would treat this as a noisy-neighbor and burst-management problem rather than simply a Kafka scaling problem. I would introduce tenant-aware admission control plus Kafka client quotas to prevent any tenant from monopolizing broker resources. I would use a tiered tenancy model: smaller predictable tenants share clusters, while high-volume or highly bursty tenants can be isolated onto dedicated topic/partition pools or clusters.</p><p>For short bursts, I would use backpressure and buffering; for sustained abnormal volume, the control plane can promote the tenant to isolated capacity. I would also isolate consumer compute and protect downstream databases and APIs because otherwise the tenant can simply move the overload downstream.</p><p>Partitioning would be by business key to guarantee per-key ordering, with an explicit strategy for hot keys. Kafka would provide hot retention and replay, while object storage would hold long-term history. Multi-region DR would use regional Kafka clusters with asynchronous replication for selected critical topics, measured against the required RPO.</p><p>The result is a platform that is shared by default, protected by quotas, tolerant of bursts, and able to isolate tenants when their workload justifies it.”</p></div></section>
+<section id="links"><h2>19. Industry references</h2><ul><li><a href="https://kafka.apache.org/documentation/#design_quotas" target="_blank" rel="noopener">Apache Kafka — Quotas</a></li><li><a href="https://kafka.apache.org/documentation/#multitenancy" target="_blank" rel="noopener">Apache Kafka — Multi-Tenancy</a></li><li><a href="https://docs.confluent.io/kafka/design/quotas.html" target="_blank" rel="noopener">Confluent — Kafka Quotas</a></li><li><a href="https://docs.confluent.io/cloud/current/clusters/client-quotas.html" target="_blank" rel="noopener">Confluent Cloud — Client Quotas</a></li></ul></section>
+<footer><strong>Interview practice order:</strong> Requirements → Capacity math → Partitioning → Broker sizing → Multi-tenancy → Burst handling → Reliability → Consumer isolation → DR → Cost → Trade-offs.</footer>
+</div>
+</body>
+</html>
